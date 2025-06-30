@@ -1,96 +1,103 @@
 require('dotenv').config();
 const WebSocket = require('ws');
-const fs = require('fs');
 const axios = require('axios');
-const path = require('path');
-const { spawn } = require('child_process');
 
-const PORT = process.env.PORT || 9000;
+const SERVER_PORT = process.env.PORT || 10000;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
-let sequence = 1;
+console.log(`Exotel ↔ ElevenLabs bridge listening on ws://0.0.0.0:${SERVER_PORT}`);
 
-const wss = new WebSocket.Server({ port: PORT }, () =>
-  console.log(`🚀 Exotel ↔ ElevenLabs bridge listening on ws://0.0.0.0:${PORT}`)
-);
-
-wss.on('connection', (ws) => {
-  console.log('✅ Connected to Exotel');
-
-  ws.on('message', async (data) => {
-    const msg = JSON.parse(data.toString());
-
-    if (msg.event === 'media') {
-      const audioRaw = Buffer.from(msg.media.payload, 'base64');
-
-      // Save audio chunk to file
-      const rawPath = `/tmp/in_audio_${Date.now()}.raw`;
-      const wavPath = `/tmp/in_audio_${Date.now()}.wav`;
-
-      fs.writeFileSync(rawPath, audioRaw);
-
-      // Convert raw to wav using ffmpeg
-      await new Promise((resolve) => {
-        const ffmpeg = spawn('ffmpeg', [
-          '-f', 's16le',
-          '-ar', '8000',
-          '-ac', '1',
-          '-i', rawPath,
-          wavPath
-        ]);
-        ffmpeg.on('close', resolve);
-      });
-
-      const speechResponse = await axios({
-        method: 'POST',
-        url: `https://api.elevenlabs.io/v1/speech-to-speech/${ELEVENLABS_VOICE_ID}`,
+async function textToSpeech(text) {
+  try {
+    const response = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+      {
+        text: text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75
+        }
+      },
+      {
         headers: {
           'xi-api-key': ELEVENLABS_API_KEY,
-          'Content-Type': 'audio/wav'
+          'Content-Type': 'application/json'
         },
-        data: fs.readFileSync(wavPath),
         responseType: 'arraybuffer'
-      });
+      }
+    );
 
-      const resRaw = Buffer.from(speechResponse.data);
+    return Buffer.from(response.data).toString('base64');
+  } catch (error) {
+    console.error('ElevenLabs TTS error:', error.message);
+    return null;
+  }
+}
 
-      // Convert ElevenLabs audio to 8kHz SLIN for Exotel
-      const outputPath = `/tmp/out_${Date.now()}.raw`;
+const wss = new WebSocket.Server({ port: SERVER_PORT });
 
-      await new Promise((resolve) => {
-        const ffmpeg = spawn('ffmpeg', [
-          '-i', '-',
-          '-f', 's16le',
-          '-ar', '8000',
-          '-ac', '1',
-          '-acodec', 'pcm_s16le',
-          outputPath
-        ]);
-        ffmpeg.stdin.write(resRaw);
-        ffmpeg.stdin.end();
-        ffmpeg.on('close', resolve);
-      });
+wss.on('connection', (ws) => {
+  console.log('Connected to Exotel');
 
-      const finalRaw = fs.readFileSync(outputPath);
-      const base64Out = finalRaw.toString('base64');
+  ws.on('message', async (msg) => {
+    let data;
+    try {
+      data = JSON.parse(msg);
+    } catch {
+      console.warn('Non-JSON message received:', msg.toString());
+      return;
+    }
 
-      ws.send(JSON.stringify({
-        event: 'media',
-        sequence_number: sequence++,
-        stream_sid: msg.stream_sid,
-        media: {
-          chunk: msg.media.chunk + 1,
-          timestamp: msg.media.timestamp + 100,
-          payload: base64Out
+    if (!data.event) return;
+
+    switch (data.event) {
+      case 'connected':
+        console.log(' Exotel WebSocket connected');
+        break;
+
+      case 'start':
+        console.log('Call started:', data.start.call_sid);
+        break;
+
+      case 'media':
+        console.log(`Received audio chunk ${data.media.chunk}`);
+        const audioBase64 = await textToSpeech('Hello, how can I assist you today?');
+        if (audioBase64) {
+          const response = {
+            event: "media",
+            stream_sid: data.stream_sid,
+            sequence_number: data.sequence_number + 1,
+            media: {
+              chunk: data.media.chunk + 1,
+              timestamp: `${parseInt(data.media.timestamp) + 100}`,
+              payload: audioBase64
+            }
+          };
+          ws.send(JSON.stringify(response));
+          console.log('Sent response audio to Exotel');
         }
-      }));
+        break;
 
-      console.log('📤 Sent audio back to Exotel');
+      case 'dtmf':
+        console.log(`DTMF received: ${data.dtmf.digit}`);
+        break;
+
+      case 'stop':
+        console.log('Call ended');
+        break;
+
+      default:
+        console.log('Unknown event:', data.event);
     }
   });
 
   ws.on('close', () => {
-    console.log('🔌 Exotel connection closed');
+    console.log('Exotel WebSocket disconnected');
+  });
+
+  ws.on('error', (err) => {
+    console.error(' WebSocket error:', err);
   });
 });
